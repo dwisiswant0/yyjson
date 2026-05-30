@@ -1,0 +1,133 @@
+name: update yyjson
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-yyjson
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update yyjson submodule
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - uses: projectdiscovery/actions/setup/go@v1
+      - uses: projectdiscovery/actions/setup/git@v1
+
+      - name: Check latest upstream release tag
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git submodule update --init yyjson
+          git -C yyjson fetch --tags --force origin
+
+          current_sha="$(git -C yyjson rev-parse HEAD)"
+          current_ref="$(git -C yyjson describe --tags --exact-match HEAD 2>/dev/null || git -C yyjson describe --tags --always HEAD)"
+          latest_tag="$(git -C yyjson tag --list --sort=-v:refname | grep -E '^(v)?[0-9]+(\.[0-9]+){1,2}$' | head -n1)"
+
+          if [ -z "$latest_tag" ]; then
+            echo "no semver release tags found in upstream yyjson" >&2
+            exit 1
+          fi
+
+          latest_sha="$(git -C yyjson rev-list -n1 "$latest_tag")"
+
+          {
+            echo "current_sha=$current_sha"
+            echo "current_ref=$current_ref"
+            echo "latest_tag=$latest_tag"
+            echo "latest_sha=$latest_sha"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$current_sha" = "$latest_sha" ]; then
+            echo "update_available=false" >> "$GITHUB_OUTPUT"
+            echo "yyjson is already at latest upstream release tag $latest_tag"
+          else
+            echo "update_available=true" >> "$GITHUB_OUTPUT"
+            echo "yyjson can update from $current_ref ($current_sha) to $latest_tag ($latest_sha)"
+          fi
+
+      - name: Update submodule, regenerate, and open PR
+        if: steps.upstream.outputs.update_available == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          CURRENT_REF: ${{ steps.upstream.outputs.current_ref }}
+          CURRENT_SHA: ${{ steps.upstream.outputs.current_sha }}
+          LATEST_TAG: ${{ steps.upstream.outputs.latest_tag }}
+          LATEST_SHA: ${{ steps.upstream.outputs.latest_sha }}
+        run: |
+          set -euo pipefail
+
+          safe_tag="$(printf '%s' "$LATEST_TAG" | tr -c '[:alnum:]._-' '-')"
+          branch="automation/update-yyjson-${safe_tag}"
+          body="$RUNNER_TEMP/yyjson-update-pr.md"
+          upstream_log="$RUNNER_TEMP/yyjson-upstream-log.txt"
+          repo_stat="$RUNNER_TEMP/yyjson-repo-stat.txt"
+
+          git checkout -B "$branch"
+
+          git -C yyjson checkout --detach "$LATEST_SHA"
+
+          # make generate runs the submodule target first; stage the new gitlink
+          # before invoking it so git submodule update keeps the requested tag.
+          git add yyjson
+          make generate
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "yyjson update produced no repository changes"
+            exit 0
+          fi
+
+          git -C yyjson log --oneline --decorate "$CURRENT_SHA..$LATEST_SHA" > "$upstream_log" || true
+          git diff --cached --stat > "$repo_stat"
+
+          git commit -m "Update yyjson submodule to ${LATEST_TAG}"
+
+          {
+            echo "## Summary"
+            echo
+            echo "- Updates \`yyjson\` from \`${CURRENT_REF}\` (\`${CURRENT_SHA}\`) to \`${LATEST_TAG}\` (\`${LATEST_SHA}\`)."
+            echo "- Runs \`make generate\` after updating the submodule."
+            echo
+            echo "## Upstream Changes"
+            echo
+            if [ -s "$upstream_log" ]; then
+              sed 's/^/- /' "$upstream_log"
+            else
+              echo "- No upstream commit log was available for this range."
+            fi
+            echo
+            echo "## Repository Changes"
+            echo
+            echo '```text'
+            cat "$repo_stat"
+            echo '```'
+          } > "$body"
+
+          git push --force-with-lease origin "$branch"
+
+          title="Update yyjson submodule to ${LATEST_TAG}"
+          existing="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // ""')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body-file "$body"
+          else
+            gh pr create --base "$BASE_BRANCH" --head "$branch" --title "$title" --body-file "$body"
+          fi

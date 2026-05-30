@@ -1,0 +1,69 @@
+name: benchmarks
+
+on:
+  workflow_call:
+    inputs:
+      count:
+        description: "Benchmark count passed to make"
+        required: false
+        default: "10"
+        type: string
+      benchtime:
+        description: "Benchmark duration or iteration count passed to make"
+        required: false
+        default: "2s"
+        type: string
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Benchmark count passed to make"
+        required: false
+        default: "10"
+        type: string
+      benchtime:
+        description: "Benchmark duration or iteration count passed to make"
+        required: false
+        default: "2s"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  artifact-metadata: write
+
+jobs:
+  benchmarks:
+    name: "Benchmarks"
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: projectdiscovery/actions/setup/go@v1
+        with:
+          go-version: "stable"
+      - run: make -C benchmarks bench
+        env:
+          GOMAXPROCS: 4
+          COUNT: ${{ inputs.count }}
+          BENCHTIME: ${{ inputs.benchtime }}
+      - run: make -C benchmarks artifact
+      - uses: actions/upload-artifact@v6
+        with:
+          name: benchmark-${{ github.run_id }}-results
+          path: benchmarks/benchmark-results.tar
+          if-no-files-found: error
+
+  benchstats:
+    name: "Benchstats"
+    needs: ["benchmarks"]
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: projectdiscovery/actions/setup/go@v1
+        with:
+          go-version: "stable"
+      - uses: actions/download-artifact@v6
+        with:
+          name: benchmark-${{ github.run_id }}-results
+          path: benchmarks
+      - run: make -C benchmarks extract-artifact
+      - run: make -C benchmarks benchstats

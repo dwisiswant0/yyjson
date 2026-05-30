@@ -1,0 +1,128 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Fuzz duration passed to make (e.g. 30m, 1h)"
+        required: false
+        default: "30m"
+        type: string
+
+env:
+  FUZZTIME: ${{ inputs.fuzztime || '30m' }}
+
+permissions:
+  contents: read
+  actions: read
+  artifact-metadata: write
+  issues: write
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: projectdiscovery/actions/setup/go@v1
+
+      - name: Run fuzzing
+        id: fuzz
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p fuzz-artifacts
+
+          echo "target=all" | tee fuzz-artifacts/fuzz-config.txt
+          echo "fuzztime=$FUZZTIME" | tee -a fuzz-artifacts/fuzz-config.txt
+          echo "sha=${{ github.sha }}" | tee -a fuzz-artifacts/fuzz-config.txt
+          echo "run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" | tee -a fuzz-artifacts/fuzz-config.txt
+
+          make fuzz FUZZTIME="$FUZZTIME" 2>&1 | tee fuzz-artifacts/fuzz.log
+          status=${PIPESTATUS[0]}
+
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Stage fuzz failure artifacts
+        if: steps.fuzz.outputs.exit_code != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz-artifacts
+          go env > fuzz-artifacts/go-env.txt
+          git status --short > fuzz-artifacts/git-status.txt
+          if [ -d testdata/fuzz ]; then
+            find testdata/fuzz -type f | sort > fuzz-artifacts/fuzz-corpus-files.txt
+          else
+            : > fuzz-artifacts/fuzz-corpus-files.txt
+          fi
+          gocache="$(go env GOCACHE)"
+          if [ -d "$gocache/fuzz" ]; then
+            mkdir -p fuzz-artifacts/go-fuzz-cache
+            cp -a "$gocache/fuzz/." fuzz-artifacts/go-fuzz-cache/
+          fi
+
+      - name: Upload fuzz failure artifact
+        id: upload-fuzz-failure
+        if: steps.fuzz.outputs.exit_code != '0'
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-failure-${{ github.run_id }}
+          path: |
+            fuzz-artifacts/**
+            testdata/fuzz/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Open fuzz failure issue
+        if: steps.fuzz.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_URL: ${{ steps.upload-fuzz-failure.outputs.artifact-url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          title="Fuzz failure: all targets at ${short_sha}"
+          artifact_url="$ARTIFACT_URL"
+          if [ -z "$artifact_url" ]; then
+            artifact_url="$RUN_URL"
+          fi
+
+          cat > fuzz-artifacts/issue.md <<EOF
+          Automated fuzzing failed.
+
+          - Target: \`all\`
+          - Fuzz time: \`${FUZZTIME}\`
+          - Commit: \`${{ github.sha }}\`
+          - Workflow run: ${RUN_URL}
+          - Failure artifact: ${artifact_url}
+
+          The artifact contains \`fuzz-artifacts/fuzz.log\`, Go environment data,
+          git status, any crash reproducers written under \`testdata/fuzz/**\`,
+          and Go fuzz cache corpus data when available.
+          EOF
+
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // ""')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file fuzz-artifacts/issue.md
+          else
+            gh issue create --title "$title" --body-file fuzz-artifacts/issue.md
+          fi
+
+      - name: Fail workflow on fuzz failure
+        if: steps.fuzz.outputs.exit_code != '0'
+        shell: bash
+        run: exit '${{ steps.fuzz.outputs.exit_code }}'

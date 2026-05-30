@@ -1,0 +1,67 @@
+name: tests
+
+on:
+  push:
+    branches: ["base"]
+    paths:
+      - '**.go'
+      - '**.mod'
+      - '**.sum'
+      - 'Makefile'
+      - 'benchmarks/**'
+      - 'yyjson'
+      - '.github/workflows/tests.yaml'
+      - '.github/workflows/benchmarks.yaml'
+  pull_request:
+    paths:
+      - '**.go'
+      - '**.mod'
+      - '**.sum'
+      - 'Makefile'
+      - 'benchmarks/**'
+      - 'yyjson'
+      - '.github/workflows/tests.yaml'
+      - '.github/workflows/benchmarks.yaml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: "Lint"
+    if: ${{ !endsWith(github.actor, '[bot]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: projectdiscovery/actions/setup/go@v1
+      - uses: projectdiscovery/actions/golangci-lint/v2@v1
+
+  tests:
+    name: "Tests (${{ matrix.os }} - ${{ matrix.go-version }})"
+    needs: ["lint"]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        go-version: ["1.25", "1.26", "stable"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: projectdiscovery/actions/setup/go@v1
+        with:
+          go-version: ${{ matrix.go-version }}
+      - run: make generate-check
+      - run: make vet
+      - run: make tests
+      - run: make fuzz-smoke
+
+  benchmarks:
+    name: "Benchmarks"
+    needs: ["tests"]
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      actions: read
+      artifact-metadata: write
+    uses: ./.github/workflows/benchmarks.yaml
